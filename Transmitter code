@@ -1,0 +1,158 @@
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <Wire.h>
+#include <math.h>
+
+// MPU6050
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define MPU_ADDR 0x68
+
+// ESP-NOW: use the same channel on both ESP32 boards
+#define WIFI_CHANNEL 1
+
+// Adjust these thresholds after testing your glove
+const float LEFT_TILT_DEG  = -25.0;
+const float RIGHT_TILT_DEG = 25.0;
+
+const unsigned long SEND_INTERVAL_MS = 150;
+const unsigned long DEBOUNCE_MS = 300;
+
+uint8_t broadcastAddress[] = {
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+uint8_t lastCommand = 255; // Unknown initial state
+unsigned long lastSendTime = 0;
+unsigned long candidateSince = 0;
+uint8_t candidateCommand = 255;
+
+// Read a signed 16-bit MPU6050 register pair
+int16_t readWord(uint8_t reg) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0) {
+    return 0;
+  }
+
+  if (Wire.requestFrom(MPU_ADDR, (uint8_t)2) != 2) {
+    return 0;
+  }
+
+  uint8_t highByte = Wire.read();
+  uint8_t lowByte = Wire.read();
+
+  return (int16_t)((highByte << 8) | lowByte);
+}
+
+void sendCommand(uint8_t command) {
+  esp_err_t result = esp_now_send(
+    broadcastAddress,
+    &command,
+    sizeof(command)
+  );
+
+  Serial.print("Command: ");
+  Serial.print(command == 1 ? "LIGHT ON" : "LIGHT OFF");
+  Serial.print(" | Send request: ");
+  Serial.println(result == ESP_OK ? "queued" : "error");
+
+  lastCommand = command;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("MPU6050 not found. Check wiring!");
+    while (true) delay(1000);
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  Serial.print("Transmitter MAC: ");
+  Serial.println(WiFi.macAddress());
+
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW initialization failed!");
+    while (true) delay(1000);
+  }
+
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = WIFI_CHANNEL;
+  peerInfo.ifidx = WIFI_IF_STA;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Could not add broadcast peer!");
+    while (true) delay(1000);
+  }
+
+  Serial.println("Transmitter ready.");
+  Serial.println("Tilt left = ON; tilt right = OFF.");
+}
+
+void loop() {
+  // Accelerometer registers: X=0x3B, Y=0x3D, Z=0x3F
+  int16_t axRaw = readWord(0x3B);
+  int16_t ayRaw = readWord(0x3D);
+  int16_t azRaw = readWord(0x3F);
+
+  // Convert raw readings to approximate tilt angle.
+  // The correct axis/sign depends on how the sensor is mounted.
+  float ax = axRaw / 16384.0;
+  float ay = ayRaw / 16384.0;
+  float az = azRaw / 16384.0;
+
+  float angle = atan2(ax, sqrt(ay * ay + az * az))
+                * 180.0 / PI;
+
+  uint8_t detected = 255; // Neutral: no command
+
+  if (angle < LEFT_TILT_DEG) {
+    detected = 1; // ON
+  } else if (angle > RIGHT_TILT_DEG) {
+    detected = 0; // OFF
+  }
+
+  unsigned long now = millis();
+
+  // Require a stable gesture before changing the light state.
+  if (detected != 255) {
+    if (detected != candidateCommand) {
+      candidateCommand = detected;
+      candidateSince = now;
+    } else if (detected != lastCommand &&
+               now - candidateSince >= DEBOUNCE_MS &&
+               now - lastSendTime >= SEND_INTERVAL_MS) {
+      sendCommand(detected);
+      lastSendTime = now;
+    }
+  } else {
+    candidateCommand = 255;
+  }
+
+  Serial.print("Tilt angle: ");
+  Serial.print(angle);
+  Serial.print(" | State: ");
+
+  if (detected == 255) Serial.println("NEUTRAL");
+  else if (detected == 1) Serial.println("LEFT / ON");
+  else Serial.println("RIGHT / OFF");
+
+  delay(40);
+}
